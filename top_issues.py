@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import sys
 from collections import defaultdict
 from datetime import date, timedelta
@@ -61,15 +62,27 @@ ISSUE_HINT_WORDS = {
 ACRONYM_MAP = {"Otp": "OTP", "Cxp": "CXP", "Sa": "SA", "Dse": "DSE"}
 ISSUE_PATTERNS = [
     "otp not received",
+    "unable to export",
+    "not matching",
+    "mismatch",
+    "inaccurate",
+    "not updating",
+    "not visible",
     "not getting completed",
     "not completed",
     "unable to",
+    "not able to",
+    "not working",
     "not showing",
     "not reflecting",
     "not reflected",
     "not updated",
     "missing from",
     "missing in",
+    "partially visible",
+    "partly visible",
+    "deactivate account",
+    "account deactivation",
     "not received",
     "error",
     "failed",
@@ -80,12 +93,24 @@ ISSUE_PATTERN_TITLE_MAP = {
     "not getting completed": "Not Completed",
     "not completed": "Not Completed",
     "unable to": "Not Completed",
+    "not able to": "Not Completed",
+    "not working": "Not Working",
     "not showing": "Not Showing",
     "not reflecting": "Not Reflecting",
     "not reflected": "Not Reflecting",
+    "not updating": "Data Not Updating",
     "not updated": "Not Updated",
+    "not visible": "Records Not Visible",
+    "unable to export": "Unable To Export",
+    "not matching": "Data Mismatch",
+    "mismatch": "Data Mismatch",
+    "inaccurate": "Data Mismatch",
     "missing from": "Not Reflecting",
     "missing in": "Not Reflecting",
+    "partially visible": "Partially Visible",
+    "partly visible": "Partially Visible",
+    "deactivate account": "Account Deactivation",
+    "account deactivation": "Account Deactivation",
     "not received": "Not Received",
     "error": "Errors",
     "failed": "Failures",
@@ -145,8 +170,14 @@ DOMAIN_SUBJECT_WORDS = {
 }
 ISSUE_CATEGORY_LABELS = {
     "visibility": "Records Not Visible",
+    "partial_visibility": "Partially Visible",
     "completion": "Unable To Complete",
     "not_received": "Not Received",
+    "not_updating": "Data Not Updating",
+    "data_mismatch": "Data Mismatch",
+    "export": "Unable To Export",
+    "not_working": "Not Working",
+    "account_deactivation": "Account Deactivation",
     "errors": "System Errors",
 }
 NEGATIVE_TITLE_HINTS = {
@@ -158,6 +189,23 @@ NEGATIVE_TITLE_HINTS = {
     "failed",
     "missing",
     "blank",
+}
+DISALLOWED_GROUP_TITLES = {
+    "general",
+    "general issue",
+    "general issues",
+    "common",
+    "common issue",
+    "common issues",
+    "other",
+    "other issue",
+    "other issues",
+    "misc",
+    "misc issue",
+    "misc issues",
+    "miscellaneous",
+    "miscellaneous issue",
+    "miscellaneous issues",
 }
 SUPPORTED_DATE_FILTERS = {
     "DAY",
@@ -216,6 +264,93 @@ def parse_args() -> argparse.Namespace:
 
 def normalize_text(text: str) -> str:
     return " ".join(text.strip().split())
+
+
+def is_generic_group_label(label: str) -> bool:
+    return normalize_text(label).lower() in DISALLOWED_GROUP_TITLES
+
+
+def infer_subject_from_text(text: str, max_words: int = 2) -> str:
+    scrubbed = re.sub(r"\S+@\S+", " ", text.lower())
+    scrubbed = re.sub(r"https?://\S+|www\.\S+", " ", scrubbed)
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9]+", scrubbed)
+
+    selected: List[str] = []
+    for token in tokens:
+        if len(token) <= 2:
+            continue
+        if (
+            token in CUSTOM_STOP_WORDS
+            or token in FILLER_TERMS
+            or token in ISSUE_HINT_WORDS
+            or token in GENERIC_ISSUE_TERMS
+        ):
+            continue
+        selected.append(token)
+        if len(selected) >= max_words:
+            break
+
+    if not selected:
+        return ""
+    return apply_acronyms(" ".join(selected).title())
+
+
+def canonical_title_tokens(value: str) -> set[str]:
+    tokens: List[str] = []
+    for raw_token in re.findall(r"[a-zA-Z]+", value.lower()):
+        token = raw_token
+        for suffix in ("ization", "isation", "ation", "tion", "ing", "ate", "ed", "es", "s"):
+            if token.endswith(suffix) and len(token) > len(suffix) + 2:
+                token = token[: -len(suffix)]
+                break
+        if len(token) <= 2 or token in CUSTOM_STOP_WORDS:
+            continue
+        tokens.append(token)
+    return set(tokens)
+
+
+def is_redundant_subject_issue(subject: str, issue_title: str) -> bool:
+    subject_tokens = canonical_title_tokens(subject)
+    issue_tokens = canonical_title_tokens(issue_title)
+    if not subject_tokens or not issue_tokens:
+        return False
+    overlap = subject_tokens & issue_tokens
+    if not overlap:
+        return False
+    minimum_len = min(len(subject_tokens), len(issue_tokens))
+    return len(overlap) >= 2 or len(overlap) >= minimum_len
+
+
+def limit_words(text: str, max_words: int) -> str:
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words])
+
+
+def compact_title(title: str, fallback_text: str = "") -> str:
+    normalized = normalize_text(title)
+    if not normalized:
+        normalized = normalize_text(fallback_text)
+
+    normalized = re.sub(r"\S+@\S+", "", normalized)
+    normalized = normalize_text(normalized)
+    if not normalized:
+        return "Reported Concern"
+
+    if " - " in normalized:
+        left, right = split_title(normalized)
+        left = limit_words(left, max_words=3)
+        right = limit_words(right, max_words=4)
+        normalized = f"{left} - {right}" if right else left
+    else:
+        normalized = limit_words(normalized, max_words=6)
+
+    if len(normalized) > 56:
+        normalized = normalized[:56].rstrip()
+        if " " in normalized:
+            normalized = normalized.rsplit(" ", 1)[0]
+    return normalize_text(normalized)
 
 
 def normalize_class_filter_value(raw_value: str) -> str:
@@ -593,7 +728,7 @@ def detect_common_issue_phrase(cluster_texts: Sequence[str]) -> str:
     return best_phrase if best_count > 0 else ""
 
 
-def detect_common_subject(cluster_texts: Sequence[str]) -> str:
+def detect_common_subject(cluster_texts: Sequence[str], min_count: int = 2) -> str:
     lowered = [text.lower() for text in cluster_texts]
     best_label = ""
     best_score = 0.0
@@ -607,77 +742,86 @@ def detect_common_subject(cluster_texts: Sequence[str]) -> str:
             best_score = weighted_score
             best_count = count
             best_label = label
-    return best_label if best_count >= 2 else ""
+    return best_label if best_count >= min_count else ""
 
 
 def build_group_title(
     cluster_texts: Sequence[str], cluster_subjects: Sequence[str], fallback_text: str
 ) -> str:
-    if len(cluster_texts) < 2:
-        return fallback_text[:80]
+    source_texts = list(cluster_texts) if cluster_texts else [fallback_text]
+    is_singleton = len(source_texts) == 1
 
-    issue_phrase = detect_common_issue_phrase(cluster_texts)
+    issue_phrase = detect_common_issue_phrase(source_texts)
     if not issue_phrase:
-        phrase_candidates = extract_top_terms(cluster_texts, ngram_range=(2, 4), top_k=15)
+        phrase_candidates = extract_top_terms(source_texts, ngram_range=(2, 4), top_k=15)
         for phrase in phrase_candidates:
             words = set(phrase.split())
             if words & ISSUE_HINT_WORDS:
                 issue_phrase = phrase
                 break
-        if not issue_phrase and phrase_candidates:
-            issue_phrase = phrase_candidates[0]
     issue_title = ISSUE_PATTERN_TITLE_MAP.get(issue_phrase, issue_phrase)
+    if not issue_title:
+        issue_title = ISSUE_CATEGORY_LABELS.get(issue_category(" ".join(source_texts[:3])), "")
 
     normalized_subjects = [normalize_text(text) for text in cluster_subjects if normalize_text(text)]
-    subject = detect_common_subject(normalized_subjects)
+    min_subject_hits = 1 if is_singleton else 2
+    subject = detect_common_subject(normalized_subjects, min_count=min_subject_hits)
     if not subject and normalized_subjects:
-        subject = detect_common_subject(cluster_texts)
-    if not subject:
+        subject = detect_common_subject(source_texts, min_count=min_subject_hits)
+    allow_subject_guess = (not is_singleton) or (not issue_title)
+    if not subject and allow_subject_guess:
         subject_candidates: List[str] = []
         if normalized_subjects:
             subject_candidates.extend(
                 extract_top_terms(normalized_subjects, ngram_range=(1, 2), top_k=12)
             )
         if not subject_candidates:
-            subject_candidates = extract_top_terms(cluster_texts, ngram_range=(2, 2), top_k=12)
-            subject_candidates.extend(extract_top_terms(cluster_texts, ngram_range=(1, 1), top_k=12))
+            subject_candidates = extract_top_terms(source_texts, ngram_range=(2, 2), top_k=12)
+            subject_candidates.extend(extract_top_terms(source_texts, ngram_range=(1, 1), top_k=12))
+        lowered_cluster_texts = [text.lower() for text in source_texts]
         for term in subject_candidates:
             words = term.split()
             if len(words) == 1 and (len(words[0]) <= 2 or words[0] in {"sa", "cxp"}):
                 continue
-            domain_count = sum(word in DOMAIN_SUBJECT_WORDS for word in words)
-            if domain_count == 0:
-                continue
-            unknown_words = [
+            meaningful_words = [
                 word
                 for word in words
-                if word not in DOMAIN_SUBJECT_WORDS
-                and word not in FILLER_TERMS
+                if word not in FILLER_TERMS
                 and word not in GENERIC_ISSUE_TERMS
+                and word not in CUSTOM_STOP_WORDS
             ]
-            if unknown_words and domain_count < 2:
+            if not meaningful_words:
                 continue
             if any(word in FILLER_TERMS for word in words):
                 continue
-            if any(word in ISSUE_HINT_WORDS for word in words):
+            if any(word in ISSUE_HINT_WORDS for word in meaningful_words):
                 continue
-            if all(word in GENERIC_ISSUE_TERMS for word in words):
+            if all(word in GENERIC_ISSUE_TERMS for word in meaningful_words):
                 continue
-            subject = term
+            term_count = sum(term.lower() in text for text in lowered_cluster_texts)
+            if len(lowered_cluster_texts) > 1 and term_count < 2:
+                continue
+            subject = " ".join(meaningful_words[:3])
             break
-    if not subject:
-        subject = "General Issue"
+    if not subject and not issue_title:
+        subject = infer_subject_from_text(fallback_text)
+    if subject and is_generic_group_label(subject):
+        subject = ""
 
     if subject and issue_title:
-        title = issue_title if subject in issue_title else f"{subject} - {issue_title}"
+        title = (
+            issue_title
+            if subject.lower() in issue_title.lower() or is_redundant_subject_issue(subject, issue_title)
+            else f"{subject} - {issue_title}"
+        )
     elif issue_title:
         title = issue_title
     elif subject:
         title = subject
     else:
-        title = fallback_text[:80]
+        title = infer_subject_from_text(fallback_text) or "Reported Concern"
 
-    return apply_acronyms(title.title())
+    return compact_title(apply_acronyms(title.title()), fallback_text=fallback_text)
 
 
 def nearest_example_text(
@@ -701,21 +845,49 @@ def split_title(title: str) -> Tuple[str, str]:
 
 
 def normalize_subject_label(subject: str) -> str:
-    lowered = subject.lower()
+    lowered = normalize_text(subject).lower()
+    if not lowered:
+        return ""
+    if "@" in lowered:
+        return ""
+    tokens = re.findall(r"[a-zA-Z]+", lowered)
+    if len(tokens) > 4:
+        return ""
+    if tokens and any(token in ISSUE_HINT_WORDS for token in tokens):
+        return ""
     if lowered in {"sa", "smart assist", "smartassist"}:
         return "Smart Assist"
     if lowered in {"cxp", "cxp system"}:
         return "CXP System"
-    if not any(word in DOMAIN_SUBJECT_WORDS for word in lowered.split()):
-        return "General Issue"
     for pattern, label in SUBJECT_PATTERNS:
         if pattern in lowered:
             return label
+    if is_generic_group_label(lowered):
+        return ""
     return apply_acronyms(subject.title())
 
 
 def issue_category(issue_label: str) -> str:
     lowered = issue_label.lower()
+    if (
+        "deactivate account" in lowered
+        or ("deactivation" in lowered and "account" in lowered)
+        or ("left" in lowered and "organization" in lowered)
+    ):
+        return "account_deactivation"
+    if ("unable to export" in lowered) or ("export" in lowered and ("unable" in lowered or "not able" in lowered)):
+        return "export"
+    if (
+        "not matching" in lowered
+        or "mismatch" in lowered
+        or "inaccurate" in lowered
+        or ("shows 0" in lowered and "shows" in lowered)
+    ):
+        return "data_mismatch"
+    if "not updating" in lowered:
+        return "not_updating"
+    if "not visible" in lowered:
+        return "visibility"
     if (
         "not showing" in lowered
         or "not reflecting" in lowered
@@ -723,8 +895,12 @@ def issue_category(issue_label: str) -> str:
         or "blank" in lowered
     ):
         return "visibility"
+    if "partially visible" in lowered or "partly visible" in lowered:
+        return "partial_visibility"
     if "not completed" in lowered or "unable to" in lowered:
         return "completion"
+    if "not working" in lowered:
+        return "not_working"
     if "not received" in lowered:
         return "not_received"
     if "error" in lowered or "fail" in lowered:
@@ -732,20 +908,35 @@ def issue_category(issue_label: str) -> str:
     return lowered or "other"
 
 
-def finalize_group_title(title: str) -> str:
+def finalize_group_title(title: str, fallback_text: str = "") -> str:
     normalized = normalize_text(title)
-    if not normalized:
-        return "General Issue"
+    if not normalized or is_generic_group_label(normalized):
+        inferred = infer_subject_from_text(fallback_text)
+        normalized = inferred if inferred else "Reported Ticket"
+
     lower_title = normalized.lower()
+    if is_generic_group_label(lower_title):
+        inferred = infer_subject_from_text(fallback_text)
+        if inferred:
+            normalized = inferred
+            lower_title = normalized.lower()
+        else:
+            return "Reported Ticket Issues"
+
     if lower_title.endswith(" issue") or lower_title.endswith(" issues"):
-        return normalized
+        return compact_title(normalized, fallback_text=fallback_text)
+
+    known_labels = {label.lower() for label in ISSUE_CATEGORY_LABELS.values()}
+    known_labels.update(label.lower() for label in ISSUE_PATTERN_TITLE_MAP.values())
+    if " - " in normalized or lower_title in known_labels:
+        return compact_title(normalized, fallback_text=fallback_text)
 
     has_negative_signal = any(hint in lower_title for hint in NEGATIVE_TITLE_HINTS)
     word_count = len([token for token in normalized.replace("-", " ").split() if token])
 
     if not has_negative_signal or word_count <= 2:
-        return f"{normalized} Issues"
-    return normalized
+        normalized = f"{normalized} Issues"
+    return compact_title(normalized, fallback_text=fallback_text)
 
 
 def merge_similar_groups(groups: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
@@ -754,8 +945,12 @@ def merge_similar_groups(groups: Sequence[Dict[str, object]]) -> List[Dict[str, 
         raw_title = str(item["title"])
         subject_raw, issue_raw = split_title(raw_title)
         subject = normalize_subject_label(subject_raw)
-        category = issue_category(issue_raw)
-        key = (subject.lower(), category)
+        source_for_category = issue_raw or subject_raw or str(item["example"])
+        category = issue_category(source_for_category)
+        if not subject and category == "other":
+            subject = infer_subject_from_text(str(item["example"]))
+        subject_key = subject.lower() if subject else normalize_text(issue_raw).lower()
+        key = (subject_key, category)
 
         if key not in merged:
             merged[key] = {
@@ -785,8 +980,25 @@ def merge_similar_groups(groups: Sequence[Dict[str, object]]) -> List[Dict[str, 
     for bucket in merged.values():
         category = str(bucket["category"])
         issue_label = ISSUE_CATEGORY_LABELS.get(category, "")
-        title = str(bucket["subject"]) if not issue_label else f"{bucket['subject']} - {issue_label}"
-        title = finalize_group_title(title)
+        if not issue_label and category not in {"other", ""}:
+            issue_label = apply_acronyms(category.replace("_", " ").title())
+        if not issue_label:
+            issue_phrase = detect_common_issue_phrase([str(bucket["example"])])
+            issue_label = ISSUE_PATTERN_TITLE_MAP.get(issue_phrase, "")
+
+        subject = normalize_text(str(bucket["subject"]))
+        if subject and issue_label:
+            title = (
+                issue_label
+                if subject.lower() in issue_label.lower()
+                or is_redundant_subject_issue(subject, issue_label)
+                else f"{subject} - {issue_label}"
+            )
+        elif issue_label:
+            title = issue_label
+        else:
+            title = subject or infer_subject_from_text(str(bucket["example"])) or "Reported Concern"
+        title = finalize_group_title(title, fallback_text=str(bucket["example"]))
         output.append(
             {
                 "count": int(bucket["count"]),
